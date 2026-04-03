@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.env
+
+# Ignore the large source Excel database (keep it local)
+database/*.xlsx
+
+# Ensure processed data is included for Vercel deployment
+data/
