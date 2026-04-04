@@ -21,61 +21,116 @@ const openai = new OpenAI({
 // Path to the processed data
 const dataPath = path.resolve(__dirname, '../data/summaryData.json');
 
+// Helper to search and filter data for the AI
+function getRelevantContext(query, chatHistory, data) {
+  const queryLower = query.toLowerCase();
+  const historyText = chatHistory.slice(-3).map(m => m.content.toLowerCase()).join(" ");
+  const combined = queryLower + " " + historyText;
+
+  // 1. Always provide state-level summaries for ALL states (very important for comparisons)
+  // We calculate these state summaries if they don't exist, or just use the pre-calculated ones if the data structure has them.
+  // Given the current summaryData.json structure, we need to aggregate or use the pre-parsed format.
+  
+  const statesArr = [];
+  const stateMap = {};
+
+  // For efficiency in the AI prompt, we'll only send the most critical fields for the states
+  data.districts.forEach(d => {
+    const sName = d.state.toUpperCase();
+    if (!stateMap[sName]) {
+      stateMap[sName] = {
+        state: sName,
+        extractionPct: 0,
+        category: "Safe",
+        _count: 0,
+        _totalExtractable: 0,
+        _totalExtraction: 0
+      };
+      statesArr.push(stateMap[sName]);
+    }
+    const s = stateMap[sName];
+    s._count++;
+    s._totalExtractable += (d.rawData["Annual Extractable Ground water Resource (ham) - Total"] || 0);
+    s._totalExtraction += (d.rawData["Ground Water Extraction for all uses (ha.m) - Total"] || 0);
+  });
+
+  statesArr.forEach(s => {
+    s.extractionPct = s._totalExtractable > 0 ? (s._totalExtraction / s._totalExtractable * 100) : 0;
+    if (s.extractionPct > 100) s.category = "Over-Exploited";
+    else if (s.extractionPct > 90) s.category = "Critical";
+    else if (s.extractionPct > 70) s.category = "Semi-Critical";
+    else s.category = "Safe";
+    
+    // Clean up internal keys
+    delete s._count;
+    delete s._totalExtractable;
+    delete s._totalExtraction;
+  });
+
+  const context = {
+    state_summaries: statesArr,
+    detailed_districts: []
+  };
+
+  // 2. Identify mentioned states and include their full district details
+  const mentionedStates = statesArr.filter(s => 
+    combined.includes(s.state.toLowerCase()) || 
+    (s.state.length > 5 && combined.includes(s.state.toLowerCase().substring(0, 5)))
+  );
+
+  if (mentionedStates.length > 0) {
+    const sNames = mentionedStates.map(s => s.state);
+    context.detailed_districts = data.districts.filter(d => sNames.includes(d.state.toUpperCase()));
+  }
+
+  return context;
+}
+
 app.post('/api/chat', async (req, res) => {
-  const { query, data, chatHistory } = req.body;
+  const { query, chatHistory } = req.body;
 
   if (!process.env.VITE_OPENAI_API_KEY) {
     return res.status(500).json({ error: 'OpenAI API Key not configured on server.' });
   }
 
+  // Load full data from disk
+  let fullData = { districts: [] };
+  try {
+    if (fs.existsSync(dataPath)) {
+      fullData = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
+    }
+  } catch (e) {
+    console.error("Data Load Error:", e);
+  }
+
+  const historyMessages = (chatHistory || []).slice(-6).map(m => ({
+    role: m.role === "ai" || m.role === "assistant" ? "assistant" : "user",
+    content: m.text || m.content
+  }));
+
+  const dataContext = getRelevantContext(query, historyMessages, fullData);
+
   const prompt = `
 You are AquaGuide AI, a friendly and intelligent groundwater assistant for India.
 
 CONVERSATION RULES:
-- If the user says a greeting (hi, hello, hey, namaste, etc.), respond warmly and briefly. Introduce yourself and ask how you can help with groundwater queries. Do NOT dump data.
-- If the user says thanks, goodbye, okay, cool, etc., respond naturally and briefly like a human would.
-- If the user asks something unrelated to groundwater or water (like weather, sports, coding, etc.), politely say you specialize in groundwater intelligence and redirect them. 
-- If the user asks "what can you do" or "help", list your capabilities briefly.
-- ONLY use the DATA CONTEXT below when the user asks an actual groundwater/water-related question.
+- If the user says a greeting, respond warmly and briefly.
+- If the user asks something unrelated to groundwater, politely redirect them.
+- ALWAYS use the DATA CONTEXT below to answer groundwater queries.
 
-CONTEXT AWARENESS (VERY IMPORTANT):
-- You receive the last few messages of the conversation. USE THEM to understand what the user is referring to.
-- If the user says "it", "this state", "that", "there", "which districts in it", etc., look at the previous messages to figure out which state/district they mean.
-- ALWAYS continue the conversation in the context of the topic being discussed. Do NOT switch to national data unless explicitly asked.
-- Understand common typos, grammatical errors, abbreviations, and informal language. Examples: "gimme", "wats", "hw is", "tel me", "show me abt", "kritical" = critical, "xploited" = exploited, "grndwater" = groundwater.
-
-DATA ACCURACY RULES (CRITICAL — FOLLOW STRICTLY):
-- You are part of the INGRES (India's National Ground Water Resource Estimation System).
-- You ONLY have CGWB (Central Ground Water Board) assessment data for FY 2024-25. NO other year exists.
-- If the user asks about 2023, 2022, 2020, or ANY other year: say "I only have FY 2024-25 data from CGWB. Would you like me to show that instead?"
-- NEVER fabricate, guess, estimate, or hallucinate ANY number. Every number you cite MUST come from the DATA CONTEXT below.
-- If a state, district, or block is NOT in the DATA CONTEXT, first check if the user is asking about a NEW state not previously discussed. If they are, politely explain: "I am currently focused on the data for [previous state]. Let me pull up the records for [new state] for you."
-- However, if the user is asking about a location that SHOULD be in the context but isn't, state: "I don't have detailed district data for [name] in my current view, but I can summarize the state-level status if available."
-- Do NOT use your general training knowledge for any data answers. ONLY use what is in DATA CONTEXT. (Note: State-level summaries are always provided, while detailed district data is focused on the states currently being discussed).
-
-AVAILABLE DATA FIELDS (per district/block):
-- Rainfall (mm), Geographical area (ha), Recharge worthy area
-- Ground Water Recharge (from rainfall, canals, irrigation, tanks, conservation structures)
-- Annual Ground Water Recharge, Environmental Flows
-- Annual Extractable Ground Water Resource
-- Ground Water Extraction for all uses
-- Stage of Ground Water Extraction (%) — this determines category: Safe (<70%), Semi-Critical (70-90%), Critical (90-100%), Over-Exploited (>100%)
-- Allocation for Domestic Use (projected 2025)
-- Net Annual Ground Water Availability for Future Use
-- Quality Tagging (what contaminants are present)
+DATA CONTEXT RULES:
+- You have access to the full CGWB FY 2024-25 database through me.
+- I have provided State Summaries for all of India below.
+- I have also provided detailed District/Block data for the states you are currently discussing.
+- If you need data for a state that isn't in "detailed_districts", use the "state_summaries" and tell the user: "I have the overall status for [State]. Would you like me to pull up the district-level details?"
 
 DATA CONTEXT:
-${JSON.stringify(data)}
+${JSON.stringify(dataContext)}
 
 User Query: "${query}"
 `;
 
   try {
-    const historyMessages = chatHistory.slice(-6).map(m => ({
-      role: m.role === "ai" ? "assistant" : "user",
-      content: m.text
-    }));
-
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
