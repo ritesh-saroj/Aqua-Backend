@@ -1,122 +1,93 @@
 import fs from 'fs';
+import path from 'path';
+
+const RAW_DATA_PATH = './data/reportData.json';
+const OUTPUT_DATA_PATH = './data/summaryData.json';
 
 try {
-  const rawData = JSON.parse(fs.readFileSync('./data/reportData.json', 'utf8'));
+  console.log('Starting Global Data Engine Reconstruction...');
+  const rawData = JSON.parse(fs.readFileSync(RAW_DATA_PATH, 'utf8'));
   const gec = rawData.GEC || Object.values(rawData)[0];
 
-  const results = [];
+  const units = [];
+  let currentState = '';
 
-  // Build human-readable header map
-  const h1 = gec[5] || {};
-  const h2 = gec[6] || {};
-  const h3 = gec[7] || {};
-  const allKeys = new Set([...Object.keys(h1), ...Object.keys(h2), ...Object.keys(h3)]);
-  
-  const sortedKeys = Array.from(allKeys).sort((a,b) => {
-    const getNum = x => x === '__EMPTY' ? 0 : parseInt(x.replace('__EMPTY_',''));
-    return getNum(a) - getNum(b);
-  });
-  
-  const headerMap = {};
-  let lastH1 = '', lastH2 = '';
-  for (const k of sortedKeys) {
-    if (h1[k]) lastH1 = h1[k];
-    if (h2[k]) lastH2 = h2[k];
-    
-    let name = lastH1;
-    if (h2[k] && h2[k] !== lastH1) name += ' - ' + h2[k];
-    if (h3[k] && h3[k] !== lastH1 && h3[k] !== h2[k]) name += ' - ' + h3[k];
-    
-    headerMap[k] = name.trim();
-  }
-
-  // start iterating after headers, usually row index 8
   for (let i = 8; i < gec.length; i++) {
     const row = gec[i];
-    if (!row.__EMPTY_1) continue; // no state
-    if (row.__EMPTY_1 === 'STATE') continue; // header
-
-    const state = String(row.__EMPTY_1).trim();
-    const district = String(row.__EMPTY_2 || '').trim();
-    const block = String(row.__EMPTY_3 || '').trim();
-
-    let extractionPct = parseFloat(row.__EMPTY_113); // Total Stage percentage
-    if (isNaN(extractionPct)) continue;
-
-    let category = "Safe";
-    if (extractionPct > 100) category = "Over-Exploited";
-    else if (extractionPct > 90) category = "Critical";
-    else if (extractionPct > 70) category = "Semi-Critical";
-
-    const mappedData = {};
-    for (const [k, v] of Object.entries(row)) {
-       if (headerMap[k]) mappedData[headerMap[k]] = v;
-    }
-
-    results.push({
-      state,
-      district,
-      block,
-      extractionPct: Math.round(extractionPct * 100) / 100,
-      category,
-      rawData: mappedData
-    });
-  }
-
-  // Aggregate stats
-  const national = {
-    totalDistricts: 0,
-    safe: 0,
-    semiCritical: 0,
-    critical: 0,
-    overExploited: 0,
-  };
-
-  const stateStats = {};
-
-  for (const district of results) {
-    const { state, category } = district;
-    national.totalDistricts++;
-    if (category === "Safe") national.safe++;
-    if (category === "Semi-Critical") national.semiCritical++;
-    if (category === "Critical") national.critical++;
-    if (category === "Over-Exploited") national.overExploited++;
-
-    if (!stateStats[state]) {
-      stateStats[state] = {
-        total: 0, safe: 0, semi: 0, critical: 0, over: 0,
-        districts: {}
-      };
-    }
-    stateStats[state].total++;
-    if (category === "Safe") stateStats[state].safe++;
-    if (category === "Semi-Critical") stateStats[state].semi++;
-    if (category === "Critical") stateStats[state].critical++;
-    if (category === "Over-Exploited") stateStats[state].over++;
-
-    if (!stateStats[state].districts[district.district]) {
-      stateStats[state].districts[district.district] = {
-        blocks: []
-      };
+    
+    // 1. Inherit or Update State
+    if (row.__EMPTY_1 && row.__EMPTY_1 !== 'STATE') {
+      currentState = String(row.__EMPTY_1).trim().toUpperCase();
     }
     
-    // Add block data to stateStats
-    stateStats[state].districts[district.district].blocks.push({
-      block: district.block,
-      extractionPct: district.extractionPct,
-      category: district.category,
-      rawData: district.rawData
+    if (!currentState || currentState === 'STATE') continue;
+
+    // 2. Identify the Assessment Unit (District or Block)
+    // Most summaries have District in EMPTY_2 and Block in EMPTY_3.
+    // If it's a district-only summary, we use EMPTY_2.
+    const districtName = String(row.__EMPTY_2 || '').trim().toUpperCase();
+    const blockName = String(row.__EMPTY_3 || '').trim().toUpperCase();
+    
+    const unitName = blockName || districtName;
+    if (!unitName || unitName === 'DISTRICT' || unitName === 'TOTAL') continue;
+
+    const extractable = parseFloat(row.__EMPTY_111) || 0;
+    const extraction = parseFloat(row.__EMPTY_112) || 0;
+    const stagePct = parseFloat(row.__EMPTY_113) || 0;
+
+    let category = "Safe";
+    if (stagePct > 100) category = "Over-Exploited";
+    else if (stagePct > 90) category = "Critical";
+    else if (stagePct > 70) category = "Semi-Critical";
+
+    units.push({
+      state: currentState,
+      district: districtName,
+      unit: unitName,
+      extractionPct: Math.round(stagePct * 100) / 100,
+      category,
+      _extractwealth: extractable,
+      _extractusage: extraction,
+      rawData: row
     });
   }
 
-  const finalData = {
-    districts: results, // all valid district rows
-    national,
-    stateStats
+  // 3. Aggregate State & District Results
+  const stateAggs = {};
+  units.forEach(u => {
+    if (!stateAggs[u.state]) {
+      stateAggs[u.state] = { state: u.state, _totalExtractable: 0, _totalExtraction: 0, unitCount: 0 };
+    }
+    stateAggs[u.state]._totalExtractable += u._extractwealth;
+    stateAggs[u.state]._totalExtraction += u._extractusage;
+    stateAggs[u.state].unitCount++;
+  });
+
+  const stateSummaries = Object.values(stateAggs).map(s => {
+    const pct = s._totalExtractable > 0 ? (s._totalExtraction / s._totalExtractable * 100) : 0;
+    let cat = "Safe";
+    if (pct > 100) cat = "Over-Exploited";
+    else if (pct > 90) cat = "Critical";
+    else if (pct > 70) cat = "Semi-Critical";
+    return {
+      state: s.state,
+      extractionPct: Math.round(pct * 100) / 100,
+      category: cat,
+      count: s.unitCount
+    };
+  }).sort((a,b) => b.extractionPct - a.extractionPct);
+
+  const finalDatabase = {
+    units: units,
+    stateSummaries: stateSummaries,
+    lastUpdate: new Date().toISOString()
   };
 
-  fs.writeFileSync('./data/summaryData.json', JSON.stringify(finalData, null, 2));
-  console.log('Successfully written data to ./data/summaryData.json');
+  fs.writeFileSync(OUTPUT_DATA_PATH, JSON.stringify(finalDatabase, null, 2));
+  console.log(`Reconstruction Complete: ${OUTPUT_DATA_PATH}`);
+  console.log(`- ${stateSummaries.length} States indexed`);
+  console.log(`- ${units.length} Units (Districts/Blocks) indexed`);
+
 } catch (e) {
-  console.error(e);
+  console.error("Data Engine Error:", e);
 }

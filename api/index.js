@@ -72,77 +72,52 @@ const handleToolCall = (toolCall) => {
   const args = JSON.parse(argsString);
 
   if (name === "get_national_summaries") {
-    // Cache aggregation if needed, but for now simple loop is fine
-    const stateMap = {};
-    data.districts.forEach(d => {
-      const sName = (d.state || "UNKNOWN").toUpperCase().trim();
-      if (!stateMap[sName]) {
-        stateMap[sName] = { state: sName, extractionPct: 0, category: "Safe", _totalExtractable: 0, _totalExtraction: 0 };
-      }
-      const s = stateMap[sName];
-      s._totalExtractable += (d.rawData["Annual Extractable Ground water Resource (ham) - Total"] || 0);
-      s._totalExtraction += (d.rawData["Ground Water Extraction for all uses (ha.m) - Total"] || 0);
-    });
-
-    return Object.values(stateMap).map(s => {
-      s.extractionPct = s._totalExtractable > 0 ? (s._totalExtraction / s._totalExtractable * 100) : 0;
-      if (s.extractionPct > 100) s.category = "Over-Exploited";
-      else if (s.extractionPct > 90) s.category = "Critical";
-      else if (s.extractionPct > 70) s.category = "Semi-Critical";
-      else s.category = "Safe";
-      delete s._totalExtractable;
-      delete s._totalExtraction;
-      return s;
-    }).sort((a,b) => b.extractionPct - a.extractionPct);
+    // Return pre-calculated state summaries from the data engine
+    if (!data.stateSummaries) return { error: "State summaries not found in database." };
+    return data.stateSummaries;
   }
 
   if (name === "search_groundwater_data") {
-    let results = data.districts;
+    let results = data.units || [];
     
     // Fuzzy match for state
     if (args.state) {
       const sQuery = args.state.toLowerCase().trim();
-      results = results.filter(d => (d.state || "").toLowerCase().includes(sQuery));
+      results = results.filter(u => (u.state || "").toLowerCase().includes(sQuery));
     }
 
-    // Fuzzy match for district
-    if (args.district) {
-      const dQuery = args.district.toLowerCase().trim();
-      const directMatch = results.filter(d => (d.district || "").toLowerCase().includes(dQuery));
+    // Fuzzy match for district/unit
+    if (args.district || args.unit) {
+      const query = (args.unit || args.district).toLowerCase().trim();
+      const directMatch = results.filter(u => 
+        (u.unit || "").toLowerCase().includes(query) || 
+        (u.district || "").toLowerCase().includes(query)
+      );
       
       if (directMatch.length > 0) {
         results = directMatch;
       } else {
-        // Fallback: If district not precisely found, return all districts in that state
-        // This helps the AI re-identify the correct district name
+        // Fallback: suggest units in that state
         return { 
-          message: `No precise match for district "${args.district}". However, here are some districts found in ${args.state || "the database"}:`,
-          top_results: results.slice(0, 15).map(r => r.district)
+          message: `No precise match for "${query}". However, here are some locations found in ${args.state || "the database"}:`,
+          top_results: results.slice(0, 15).map(r => r.unit || r.district)
         };
       }
     }
 
     if (args.category) {
-      results = results.filter(d => d.category === args.category);
+      results = results.filter(u => u.category === args.category);
     }
     
-    // Return only top 50 matches
-    const finalMatches = results.slice(0, 50).map(d => ({
-      state: d.state,
-      district: d.district,
-      block: d.block,
-      category: d.category,
-      extractionPct: d.extractionPct,
-      extraction_ham: d.rawData["Ground Water Extraction for all uses (ha.m) - Total"],
-      recharge_ham: d.rawData["Annual Ground water Recharge (ham) - Total"],
-      quality: d.rawData["Quality Tagging - Major Parameter Present - C"]
+    // Return top matches with all relevant INGRES keys from rawData
+    return results.slice(0, 30).map(u => ({
+      state: u.state,
+      district: u.district,
+      unit: u.unit,
+      category: u.category,
+      extractionPct: u.extractionPct,
+      ...u.rawData // Include full INGRES parameters for detailed answers
     }));
-
-    if (finalMatches.length === 0) {
-      return { message: "No matching records found. Try searching for the State name only to see available districts." };
-    }
-    
-    return finalMatches;
   }
 
   return { error: "Unknown tool" };
