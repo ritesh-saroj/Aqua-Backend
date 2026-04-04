@@ -18,8 +18,8 @@ const openai = new OpenAI({
   apiKey: process.env.VITE_OPENAI_API_KEY,
 });
 
-// Path to the processed data
-const dataPath = path.resolve(__dirname, '../data/summaryData.json');
+// Path to the processed data (Robust for Vercel)
+const dataPath = path.join(process.cwd(), 'data', 'summaryData.json');
 
 // Cache data in memory (singleton pattern)
 let groundwaterData = null;
@@ -29,13 +29,15 @@ const loadGroundwaterData = () => {
   try {
     if (fs.existsSync(dataPath)) {
       groundwaterData = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
-      console.log("Database Loaded Successfully: " + groundwaterData.districts.length + " records.");
+      console.log(`Database Loaded: ${groundwaterData.units?.length || 0} units found.`);
       return groundwaterData;
+    } else {
+      console.error(`DATABASE NOT FOUND at ${dataPath}`);
     }
   } catch (e) {
     console.error("Critical Data Load Error:", e);
   }
-  return { districts: [] };
+  return { units: [], stateSummaries: [] };
 };
 
 // ─── AI Tools (Function Calling) ─────────────────────────
@@ -72,9 +74,16 @@ const handleToolCall = (toolCall) => {
   const args = JSON.parse(argsString);
 
   if (name === "get_national_summaries") {
-    // Return pre-calculated state summaries from the data engine
-    if (!data.stateSummaries) return { error: "State summaries not found in database." };
-    return data.stateSummaries;
+    if (!data.stateSummaries) return { error: "State summaries not found." };
+    return data.stateSummaries.map(s => ({
+      state: s.state,
+      extractionPct: s.extractionPct,
+      category: s.category,
+      unitCount: s.unitCount,
+      // Provide some key national parameters in the summary
+      environmental_flow_ham: s.fullStats["Annual Ground Water Allocation for Natural Discharge (Environmental flow) (ha.m) - Total"] || 0,
+      total_recharge_ham: s.fullStats["Total Annual Ground Water Recharge (ha.m) - Total"] || 0
+    }));
   }
 
   if (name === "search_groundwater_data") {
@@ -83,6 +92,16 @@ const handleToolCall = (toolCall) => {
     // Fuzzy match for state
     if (args.state) {
       const sQuery = args.state.toLowerCase().trim();
+      // Check if it's a state-level aggregation request
+      if (!args.district && !args.unit) {
+        const stateSummary = data.stateSummaries.find(s => s.state.toLowerCase().includes(sQuery));
+        if (stateSummary) {
+          return {
+            type: "STATE_SUMMARY",
+            ...stateSummary
+          };
+        }
+      }
       results = results.filter(u => (u.state || "").toLowerCase().includes(sQuery));
     }
 
@@ -97,10 +116,9 @@ const handleToolCall = (toolCall) => {
       if (directMatch.length > 0) {
         results = directMatch;
       } else {
-        // Fallback: suggest units in that state
         return { 
-          message: `No precise match for "${query}". However, here are some locations found in ${args.state || "the database"}:`,
-          top_results: results.slice(0, 15).map(r => r.unit || r.district)
+          message: `No precise match for "${query}". Available in ${args.state || "this search"}:`,
+          suggestions: results.slice(0, 15).map(r => r.unit || r.district)
         };
       }
     }
@@ -109,14 +127,13 @@ const handleToolCall = (toolCall) => {
       results = results.filter(u => u.category === args.category);
     }
     
-    // Return top matches with all relevant INGRES keys from rawData
-    return results.slice(0, 30).map(u => ({
+    return results.slice(0, 20).map(u => ({
       state: u.state,
       district: u.district,
       unit: u.unit,
       category: u.category,
       extractionPct: u.extractionPct,
-      ...u.rawData // Include full INGRES parameters for detailed answers
+      ...u.parameters // Now in human-readable plain English!
     }));
   }
 
