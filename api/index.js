@@ -169,18 +169,18 @@ app.post('/api/chat', async (req, res) => {
       
       VISUALIZATION & FORMATTING RULES:
       - NEVER write "chonky" paragraphs. Keep every paragraph to 2 sentences maximum.
-      - Use systematic sections with ### headers (e.g., ### 📊 Data Overview, ### 💡 Consultant's Analysis).
-      - Use Markdown Tables for all numeric comparisons.
-      - You MUST provide a visual chart (\`\`\`chart) for all data summaries with more than 3 items.
-      - Use creative icons (💧, 📈, ⚠️, 🔍) to highlight key findings.
-      - Provide a "Key Takeaways" bulleted list for every response.
+      - Use systematic sections with ### headers (e.g., ### 📉 Visual Contrast, ### 📋 Detailed Comparison, ### 💡 Consultant's Verdict).
+      - For 2-location comparisons (like Ludhiana vs Lucknow), you MUST provide a Bar Chart (\`\`\`chart) first to show the most critical differences.
+      - In tables, use emojis for status: 🔴 (Over-Exploited), 🟠 (Critical), 🟡 (Semi-Critical), 🟢 (Safe).
+      - Use --- horizontal dividers between major sections to increase "white space" and readability.
+      - Use Markdown Tables for numeric data, but keep them focused on the most impactful 5-6 parameters.
       
       ANALYTICAL INSIGHTS:
-      - After providing data, always include a "Consultant's Recommendation" section.
-      - If a district is 'Critical' or 'Over-Exploited', provide actionable bolded advice based ONLY on the 2024-25 assessment.
+      - Every comparison MUST end with a "Consultant's Verdict" (which location is more strained and why).
+      - Provide actionable bolded advice based ONLY on the 2024-25 assessment.
       
       CONVERSATIONAL AWARENESS:
-      - Use the provided context to resolve follow-ups like "What about Kerala?" after earlier discussing West Bengal.` 
+      - Keep it warm, greet back, and handle informal language naturally.` 
     },
     ...historyMessages,
     { role: "user", content: query }
