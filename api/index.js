@@ -21,15 +21,22 @@ const openai = new OpenAI({
 // Path to the processed data
 const dataPath = path.resolve(__dirname, '../data/summaryData.json');
 
-// Load full data into memory once
-let groundwaterData = { districts: [] };
-try {
-  if (fs.existsSync(dataPath)) {
-    groundwaterData = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
+// Cache data in memory (singleton pattern)
+let groundwaterData = null;
+
+const loadGroundwaterData = () => {
+  if (groundwaterData) return groundwaterData;
+  try {
+    if (fs.existsSync(dataPath)) {
+      groundwaterData = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
+      console.log("Database Loaded Successfully: " + groundwaterData.districts.length + " records.");
+      return groundwaterData;
+    }
+  } catch (e) {
+    console.error("Critical Data Load Error:", e);
   }
-} catch (e) {
-  console.error("Critical Data Load Error:", e);
-}
+  return { districts: [] };
+};
 
 // ─── AI Tools (Function Calling) ─────────────────────────
 
@@ -46,12 +53,12 @@ const tools = [
     type: "function",
     function: {
       name: "search_groundwater_data",
-      description: "Search for detailed district-level groundwater data. You can filter by state name, district name, or assessment category (Safe, Semi-Critical, Critical, Over-Exploited).",
+      description: "Search for detailed district-level groundwater data. Filter by state name, district name, or assessment category (Safe, Semi-Critical, Critical, Over-Exploited).",
       parameters: {
         type: "object",
         properties: {
-          state: { type: "string", description: "Name of the state (e.g., 'Jharkhand', 'Maharashtra')." },
-          district: { type: "string", description: "Name of the district (e.g., 'Ranchi', 'Pune')." },
+          state: { type: "string", description: "Name of the state (e.g., 'Jharkhand', 'West Bengal')." },
+          district: { type: "string", description: "Name of the district (e.g., 'Ranchi', 'Howrah')." },
           category: { type: "string", enum: ["Safe", "Semi-Critical", "Critical", "Over-Exploited"], description: "Filter by assessment category." }
         }
       }
@@ -60,14 +67,15 @@ const tools = [
 ];
 
 const handleToolCall = (toolCall) => {
+  const data = loadGroundwaterData();
   const { name, arguments: argsString } = toolCall.function;
   const args = JSON.parse(argsString);
 
   if (name === "get_national_summaries") {
-    // Aggregate data for all states
+    // Cache aggregation if needed, but for now simple loop is fine
     const stateMap = {};
-    groundwaterData.districts.forEach(d => {
-      const sName = d.state.toUpperCase();
+    data.districts.forEach(d => {
+      const sName = (d.state || "UNKNOWN").toUpperCase().trim();
       if (!stateMap[sName]) {
         stateMap[sName] = { state: sName, extractionPct: 0, category: "Safe", _totalExtractable: 0, _totalExtraction: 0 };
       }
@@ -85,25 +93,56 @@ const handleToolCall = (toolCall) => {
       delete s._totalExtractable;
       delete s._totalExtraction;
       return s;
-    });
+    }).sort((a,b) => b.extractionPct - a.extractionPct);
   }
 
   if (name === "search_groundwater_data") {
-    let results = groundwaterData.districts;
-    if (args.state) results = results.filter(d => d.state.toLowerCase().includes(args.state.toLowerCase()));
-    if (args.district) results = results.filter(d => d.district.toLowerCase().includes(args.district.toLowerCase()));
-    if (args.category) results = results.filter(d => d.category === args.category);
+    let results = data.districts;
     
-    // Return only top 50 matches to stay within token limits
-    return results.slice(0, 50).map(d => ({
+    // Fuzzy match for state
+    if (args.state) {
+      const sQuery = args.state.toLowerCase().trim();
+      results = results.filter(d => (d.state || "").toLowerCase().includes(sQuery));
+    }
+
+    // Fuzzy match for district
+    if (args.district) {
+      const dQuery = args.district.toLowerCase().trim();
+      const directMatch = results.filter(d => (d.district || "").toLowerCase().includes(dQuery));
+      
+      if (directMatch.length > 0) {
+        results = directMatch;
+      } else {
+        // Fallback: If district not precisely found, return all districts in that state
+        // This helps the AI re-identify the correct district name
+        return { 
+          message: `No precise match for district "${args.district}". However, here are some districts found in ${args.state || "the database"}:`,
+          top_results: results.slice(0, 15).map(r => r.district)
+        };
+      }
+    }
+
+    if (args.category) {
+      results = results.filter(d => d.category === args.category);
+    }
+    
+    // Return only top 50 matches
+    const finalMatches = results.slice(0, 50).map(d => ({
       state: d.state,
       district: d.district,
+      block: d.block,
       category: d.category,
       extractionPct: d.extractionPct,
       extraction_ham: d.rawData["Ground Water Extraction for all uses (ha.m) - Total"],
       recharge_ham: d.rawData["Annual Ground water Recharge (ham) - Total"],
       quality: d.rawData["Quality Tagging - Major Parameter Present - C"]
     }));
+
+    if (finalMatches.length === 0) {
+      return { message: "No matching records found. Try searching for the State name only to see available districts." };
+    }
+    
+    return finalMatches;
   }
 
   return { error: "Unknown tool" };
@@ -128,12 +167,16 @@ app.post('/api/chat', async (req, res) => {
       role: "system", 
       content: `You are AquaGuide AI, a groundwater specialist for INGRES (India).
       
+      SEARCH STRATEGY:
+      1. Always use 'search_groundwater_data' for district or block level questions.
+      2. If you search for a district and get "No precise match", the tool will provide a list of available districts for that state. USE THAT LIST to find the correct spelling and search again.
+      3. For West Bengal, the districts are stored as "24 PARGANAS NORTH", "24 PARGANAS SOUTH", etc. If a user says "North 24 Parganas", search for the matching record in the state list provided by the tool.
+      4. Use 'get_national_summaries' for comparisons between different states.
+      
       RULES:
-      1. You have tools to access dynamic CGWB FY 2024-25 data for 36 States/UTs and 713+ districts.
-      2. If you need data, call the appropriate search tool. 
-      3. Never say "I don't have data" without calling a tool first.
-      4. If a search yields zero results, mention you checked the CGWB 2024 records and found no matching location.
-      5. Keep responses professional, data-driven, and human-friendly.` 
+      1. Never say "I don't have data" without searching the State list first if a district search fails.
+      2. If a search yields zero results after trying both district and state-level lookups, explain you checked the CGWB 2024 records carefully.
+      3. Keep responses professional and use the specific numbers provided in the tool results.` 
     },
     ...historyMessages,
     { role: "user", content: query }
